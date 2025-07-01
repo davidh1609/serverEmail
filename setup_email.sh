@@ -6,7 +6,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # Variables (ajusta si fuera necesario)
-readonly IFACE="emp0s8"
+readonly IFACE="enp0s8"
 readonly NETWORK="192.168.56.0"
 readonly NETMASK="255.255.255.0"
 readonly RANGE_START="192.168.56.100"
