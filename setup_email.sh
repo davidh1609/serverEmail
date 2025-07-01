@@ -1,29 +1,47 @@
 #!/usr/bin/env bash
-set -e
+# setup-mail-server.sh - Instalación y configuración básica de servidor DHCP, DNS, MTA/MDA y webmail en Ubuntu Server 24.
+# Mayor robustez: validaciones, creación automática de DB Roundcube, manejo de errores y ajuste de servicio DNS (named)
+
+set -euo pipefail
+IFS=$'\n\t'
 
 # Variables (ajusta si fuera necesario)
-IFACE="emp0s8"
-NETWORK="192.168.56.0"
-NETMASK="255.255.255.0"
-RANGE_START="192.168.56.100"
-RANGE_END="192.168.56.200"
-GATEWAY="192.168.56.1"
-# Dominio ajustado a midominio.com (puedes cambiar a midominio.christian si lo prefieres)
-DOMAIN="midominio.com"
-HOST="mail"
-FQDN="${HOST}.${DOMAIN}"
-DB_PATH="/var/lib/bind"
+readonly IFACE="emp0s8"
+readonly NETWORK="192.168.56.0"
+readonly NETMASK="255.255.255.0"
+readonly RANGE_START="192.168.56.100"
+readonly RANGE_END="192.168.56.200"
+readonly GATEWAY="192.168.56.1"
+# Dominio (elige midominio.com o midominio.christian)
+readonly DOMAIN="midominio.com"
+readonly HOST="mail"
+readonly FQDN="${HOST}.${DOMAIN}"
+readonly DB_PATH="/var/lib/bind"
+# Credenciales de base de datos Roundcube
+readonly RC_DB_NAME="roundcube"
+readonly RC_DB_USER="rc_user"
+readonly RC_DB_PASS="$(openssl rand -base64 12)"
 
-echo "==> Actualizando repositorios e instalando paquetes..."
+log() { echo "[INFO] $*"; }
+err() { echo "[ERROR] $*" >&2; exit 1; }
+
+# Verificar interfaz
+if ! ip link show "${IFACE}" &>/dev/null; then
+  err "La interfaz ${IFACE} no existe. Ajusta IFACE al valor correcto."
+fi
+
+log "Actualizando repositorios e instalando paquetes..."
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   isc-dhcp-server bind9 bind9utils bind9-doc \
-  apache2 postfix postfix-mysql dovecot-imapd dovecot-pop3d \
-  roundcube roundcube-core roundcube-mysql
+  postfix postfix-mysql dovecot-imapd dovecot-pop3d \
+  mariadb-server apache2 php php-mysql php-intl php-zip php-mbstring php-pear php-net-smtp php-net-socket php-mail-mime wget unzip
 
-echo "==> Configurando ISC-DHCP-Server..."
+# Servicio DNS real es 'named'
+DNS_SERVICE="named"
+
+log "Configurando ISC-DHCP-Server en interfaz ${IFACE}..."
 cat > /etc/default/isc-dhcp-server <<EOF
-# INTERFACESv4: interfaz en la que escucha DHCPv4
 INTERFACESv4="${IFACE}"
 INTERFACESv6=""
 EOF
@@ -43,8 +61,7 @@ subnet ${NETWORK} netmask ${NETMASK} {
 }
 EOF
 
-echo "==> Configurando BIND9 (DNS)..."
-# Habilitar consultas recursivas sólo desde la red interna
+log "Configurando BIND9 (DNS) para ${DOMAIN}..."
 cat > /etc/bind/named.conf.options <<EOF
 options {
     directory "/var/cache/bind";
@@ -58,7 +75,6 @@ options {
 };
 EOF
 
-# Zona directa
 cat >> /etc/bind/named.conf.local <<EOF
 zone "${DOMAIN}" {
     type master;
@@ -66,63 +82,83 @@ zone "${DOMAIN}" {
 };
 EOF
 
-# Crear archivo de zona
 cat > ${DB_PATH}/db.${DOMAIN} <<EOF
-$TTL    604800
+\$TTL    604800
 @       IN      SOA     ns.${DOMAIN}. admin.${DOMAIN}. (
-                              2         ; Serial
+                              4         ; Serial
                          604800         ; Refresh
                           86400         ; Retry
                         2419200         ; Expire
                          604800 )       ; Negative Cache TTL
 
-; Name servers
-        IN      NS      ns.${DOMAIN}.
-
-; Registros A
+@       IN      NS      ns.${DOMAIN}.
 ns      IN      A       ${GATEWAY}
 ${HOST} IN      A       ${GATEWAY}
-
-; MX
 @       IN      MX 10   ${HOST}.${DOMAIN}.
-
 EOF
-
 chown root:bind ${DB_PATH}/db.${DOMAIN}
 chmod 640 ${DB_PATH}/db.${DOMAIN}
 
-echo "==> Configurando Postfix y Dovecot..."
-# Postfix: usar dominio local
-postconf -e "myhostname = ${FQDN}"
-postconf -e "mydomain = ${DOMAIN}"
-postconf -e "myorigin = \$mydomain"
-postconf -e "inet_interfaces = all"
-postconf -e "mydestination = \$myhostname, localhost.\$mydomain, localhost, \$mydomain"
-postconf -e "home_mailbox = Maildir/"
+log "Configurando MariaDB y creando BD Roundcube..."
+systemctl start mariadb
+mysql --user=root <<SQL
+CREATE DATABASE IF NOT EXISTS \`${RC_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+CREATE USER IF NOT EXISTS '${RC_DB_USER}'@'localhost' IDENTIFIED BY '${RC_DB_PASS}';
+GRANT ALL ON \`${RC_DB_NAME}\`.* TO '${RC_DB_USER}'@'localhost';
+FLUSH PRIVILEGES;
+SQL
 
-# Dovecot: asegurar soporte Maildir
-sed -i 's|#mail_location = .*|mail_location = maildir:~/Maildir|' /etc/dovecot/conf.d/10-mail.conf
+log "Instalando Roundcube manualmente..."
+cd /tmp
+wget -q https://github.com/roundcube/roundcubemail/releases/download/1.6.2/roundcubemail-1.6.2-complete.tar.gz
+rm -rf /var/www/html/roundcube
+tar xzf roundcubemail-1.6.2-complete.tar.gz
+mv roundcubemail-1.6.2 /var/www/html/roundcube
+chown -R www-data:www-data /var/www/html/roundcube
 
-# Permitir login plain (sólo dentro de la demo)
-sed -i 's|#disable_plaintext_auth = yes|disable_plaintext_auth = no|' /etc/dovecot/conf.d/10-auth.conf
-sed -i 's|auth_mechanisms = .*|auth_mechanisms = plain login|' /etc/dovecot/conf.d/10-auth.conf
+log "Configurando Roundcube..."
+cat > /var/www/html/roundcube/config/config.inc.php <<EOF
+<?php
+global \$config;
+\$config['db_dsnw'] = 'mysql://${RC_DB_USER}:${RC_DB_PASS}@localhost/${RC_DB_NAME}';
+\$config['default_host'] = 'localhost';
+\$config['smtp_server'] = 'localhost';
+\$config['smtp_port'] = 25;
+\$config['mail_domain'] = '${DOMAIN}';
+\$config['support_url'] = '';
+\$config['product_name'] = 'Demo Mail';
+\$config['plugins'] = ['archive', 'managesieve'];
+?>
+EOF
 
-echo "==> Configurando Roundcube (webmail... )"
-# Apuntar Apache a Roundcube
-a2enconf roundcube
-a2enmod rewrite headers
+log "Configurando Apache para Roundcube..."
+a2enmod rewrite headers ssl
+cat > /etc/apache2/sites-available/roundcube.conf <<EOF
+<VirtualHost *:80>
+    ServerName ${FQDN}
+    DocumentRoot /var/www/html/roundcube
+    <Directory /var/www/html/roundcube/>
+      Options +FollowSymLinks
+      AllowOverride All
+      Require all granted
+    </Directory>
+    ErrorLog "/var/log/apache2/roundcube_error.log"
+    CustomLog "/var/log/apache2/roundcube_access.log" combined
+</VirtualHost>
+EOF
 
-echo "==> Reiniciando servicios..."
-systemctl restart isc-dhcp-server
-systemctl restart bind9
-systemctl restart postfix
-systemctl restart dovecot
-systemctl restart apache2
+a2dissite 000-default
+a2ensite roundcube
 
-echo "==> Habilitando servicios al arranque..."
-systemctl enable isc-dhcp-server bind9 postfix dovecot apache2
+log "Reiniciando y habilitando servicios..."
+services=(isc-dhcp-server "${DNS_SERVICE}" mariadb postfix dovecot apache2)
+for svc in "${services[@]}"; do
+  log "-> Restarting \$svc..."
+  systemctl restart "\$svc"
+  log "-> Enabling \$svc..."
+  systemctl enable "\$svc"
+done
 
-echo "==> ¡Listo!"
-echo "  • DHCP corriendo en ${IFACE}, rango ${RANGE_START}-${RANGE_END}"
-echo "  • DNS autoritativo para ${DOMAIN}, host ${FQDN}"
-echo "  • Webmail disponible en: http://${FQDN}/roundcube/"
+log "¡Configuración completada!"
+echo "- Webmail: http://${FQDN}/"
+echo "- BD Roundcube: usuario=${RC_DB_USER} contraseña=${RC_DB_PASS}"
